@@ -1,0 +1,155 @@
+#
+# Design notes
+#   - Every service has a named volume (data survives `down`, dies with `down -v`).
+#   - Every service has a healthcheck (so `depends_on: condition: service_healthy`
+#     can be used later).
+#   - Required secrets use ${VAR:?message}: compose refuses to start without them.
+#   - Ports are bound to 127.0.0.1 so nothing is exposed to the network by accident.
+#   - Image tags come from .env with defaults. Pin exact versions (or digests)
+#     after the first successful run: "latest" is not reproducible.
+#   - Memory limits make failure experiments reproducible.
+#   - Scale-readiness rules (docs/scalability.md): no container_name and no fixed
+#     host ports on anything that must be replicated (the API and workers will be
+#     added later), all behaviour comes from environment variables, and all state
+#     lives in named volumes. These rules make `docker compose up --scale worker=N`
+#     work, and make a later move to Kubernetes a packaging change, not a redesign.
+# =============================================================================
+
+
+name: docforge
+
+x-common: &common
+  restart: unless-stopped
+  logging: 
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+
+  postgres:
+    <<: *common
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    mem_limit: 1g
+
+
+  objectstore:
+    <<: *common
+    image: chrislusf/seaweedfs:latest
+    command: ["mini", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+    ports:
+      - "127.0.0.1:8333:8333"     # S3 API
+      - "127.0.0.1:23646:23646"   # admin UI
+    volumes:
+      - objectstore_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -S -O /dev/null http://127.0.0.1:8333/ 2>&1 | grep -q 'HTTP/'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    mem_limit: 1g
+
+
+  rabbitmq:
+    <<: *common
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: docforge
+    ports:
+      - "127.0.0.1:5672:5672"     # AMQP
+      - "127.0.0.1:15672:15672"   # management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    mem_limit: 1g
+
+  qdrant:
+    <<: *common
+    image: qdrant/qdrant:v1.15.0
+    ports:
+      - "127.0.0.1:6333:6333"   # REST
+      - "127.0.0.1:6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: 
+        - CMD
+        - bash
+        - -c
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/6333
+          printf 'GET /readyz HTTP/1.0\r\n\r\n' >&3
+          head -n 1 <&3 | grep -q ' 200 '
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    mem_limit: 2g
+
+
+  redis-cache:
+    <<: *common
+    profiles: ["scale"]
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 384m
+
+
+  redis-state:
+    <<: *common
+    profiles: ["scale"]
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_state_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 384m
+
+
+  volumes:
+    pg_data:
+    objectstore_data:
+    rabbitmq_data:
+    qdrant_data:
+    redis_state_data:
