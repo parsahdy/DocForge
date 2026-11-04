@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     presign_expires_s: int = 900
 
     # --- queue (W10): the queue type is fixed when a queue is declared --------
-    queue_type = Literal["quorum", "classic"] = "quorum"
+    queue_type: Literal["quorum", "classic"] = "quorum"
 
     # --- pipeline ------------------------------------------------------------
     chunker_version: str = "c1"
