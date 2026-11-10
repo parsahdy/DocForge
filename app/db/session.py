@@ -62,7 +62,7 @@ def session_scope() -> Iterator[Session]:
     """
     session = get_session_factory()()
     try:
-        yield Session
+        yield session
         session.commit()
     except Exception:
         session.rollback()
