@@ -21,7 +21,7 @@ class JobMessage(BaseModel):
 
     v: int = 1
     file_id: uuid.UUID
-    tanent_id: str
+    tenant_id: str
 
     def to_wire(self) -> dict[str, Any]:
         return {"v": self.v, "file_id": str(self.file_id), "tenant_id": self.tenant_id}
