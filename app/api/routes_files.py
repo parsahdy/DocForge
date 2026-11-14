@@ -41,6 +41,16 @@ def _get_or_404(db: Session, tenant_id: str, file_id: uuid.UUID) -> File:
     return row
 
 
+def _publish_or_503(publish: Publisher, row: File, tenant_id: str, file_id: uuid.UUID) -> None:
+    try:
+        publish(JobMessage(file_id=file_id, tenant_id=tenant_id), row.queue or QUEUE_SMALL)
+    except Exception as exc:  # the broker is down: the row stays QUEUED and the reconciler will publish it
+        logger.error("publish failed", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+            detail="queue unavailable, retry", headers={"Retry-After": "5"}) from exc
+
+
 @router.post("", status_code=201, response_model=CreateFileResponse)
 def create_file(
     body: CreateFileRequest,
@@ -125,14 +135,9 @@ def complete_upload(
         db.refresh(row)
 
     if row.status == Status.QUEUED.value:
-        try:
-            publish(JobMessage(file_id=file_id, tenant_id=tenant_id), row.queue or QUEUE_SMALL)
-        except Exception as exc:  # the broker is down: the row stays QUEUED, the client may retry
-            logger.error("publish failed", exc_info=exc)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="queue unavailable, retry", headers={"Retry-After": "5"}
-            ) from exc
+        if row.status == Status.QUEUED.value:
+            _publish_or_503(publish, row, tenant_id, file_id)
+        return row
 
     return row    
 
@@ -160,3 +165,22 @@ def list_files(
                 status_code=422, 
                 detail=f"unknown status: {status}"
             ) from None
+
+
+@router.post("/{file_id}/retry", status_code=202, response_model=FileOut)
+def retry_file(file_id: uuid.UUID, tenant_id: TenantId, db: Db, publish: PublisherDep) -> File:
+    """User-level retry of a FAILED file (FR4): no new upload needed."""
+    row = _get_or_404(db, tenant_id, file_id)
+    if row.status != Status.FAILED.value:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="only FAILED files can be retried")
+    if row.original_deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="the original was removed by the retention policy")
+    transition(
+        db, tenant_id, file_id, Status.FAILED, Status.QUEUED,
+        attempts=0, retry_at=None, error_code=None, error_message=None, finished_at=None,
+    )
+    db.commit()
+    db.refresh(row)
+    if row.status == Status.QUEUED.value:
+        _publish_or_503(publish, row, tenant_id, file_id)
+    return row

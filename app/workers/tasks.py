@@ -6,11 +6,14 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.core.messages import JobMessage
+from app.core.errors import PermanentError
 from app.pipeline.embed import FakeEmbedder
 from app.pipeline.run import Deps, run_job
 from app.services.storage import Storage
 from app.services.vectors import VectorStore
 from app.workers.celery_app import celery_app
+
+from celery.exceptions import Reject
 
 _deps = Deps | None = None
 
@@ -37,5 +40,9 @@ def get_deps() -> Deps:
 
 @celery_app.task(name="docforge.process_file")
 def process_file(msg: dict[str, Any]) -> None:
-    job = JobMessage.parse(msg)
+    try:
+        job = JobMessage.parse(msg)
+    except PermanentError as exc:
+        # A message we can never process: send it to the dead letter queue instead of dropping it silently.
+        raise Reject(str(exc), requeue=False) from exc
     run_job(job, get_deps())

@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from datetime import timedelta
 
 from qdrant_client import models as qm
 
@@ -32,6 +33,7 @@ from app.core.keys import chunks_key, text_key
 from app.core.logging import log_context
 from app.core.messages import JobMessage
 from app.core.states import Status
+from app.core.retry import backoff_delay
 from app.db.models import File, utcnow
 from app.db.session import session_scope
 from app.db.transitions import transition
@@ -72,26 +74,29 @@ def run_job(job: JobMessage, deps: Deps) -> None:
                 sha256 = stage_parse(deps, info, work)
                 stage_chunk(deps, info, work)
                 chunk_count = stage_embed(deps, info, work)
+            # Idempotency, part 2: remove points a previous chunker version left behind.
+            deps.vectors.delete_other_versions(info.tenant_id, info.file_id, deps.settings.chunker_version)
             _finish(job, sha256, chunk_count)
             logger.info(
                 "file ready",
                 extra={"fields": {"chunks": chunk_count, "duration_s": round(time.perf_counter() - started, 2)}},
             )
         except Exception as exc:  # noqa: BLE001 - every failure must end in a recorded state
-            _fail(job, exc)
+            _handle_failure(job, exc, deps.settings)
 
 
 def _claim(job: JobMessage) -> FileInfo | None:
     """QUEUED -> PROCESSING as a compare-and-set. Exactly one worker can win."""
     with session_scope() as db:
         won = transition(
-            job,
+            db,
             job.tenant_id,
             job.file_id,
             Status.QUEUED,
             Status.PROCESSING,
             attempts=File.attempts + 1,
             started_at=utcnow(),
+            retry_at=None,
             error_code=None,
             error_message=None,
         )
@@ -99,10 +104,59 @@ def _claim(job: JobMessage) -> FileInfo | None:
         if not won or row is None:
             logger.info(
                 "job skipped",
-                extra={"fields": {"reason": "not_queued", "status": row.status if row else "missing"}}
+                extra={"fields": {"reason": "not_queued", "status": row.status if row else "missing"}},
             )
             return None
         return FileInfo(job.tenant_id, job.file_id, row.filename, row.s3_key)
+
+
+def _handle_failure(job: JobMessage, exc: Exception, settings: Settings) -> None:
+    """Retry or give up. Only a PermanentError is never retried; everything else has an attempt budget."""
+    permanent = isinstance(exc, PermanentError)
+    if isinstance(exc, (PermanentError, TransientError)):
+        code, message = exc.code, str(exc)
+    else:
+        code, message = "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}"
+
+    with session_scope() as db:
+        row = db.get(File, (job.tenant_id, job.file_id))
+        attempts = row.attempts if row is not None else settings.max_attempts
+        if not permanent and attempts < settings.max_attempts:
+            delay = backoff_delay(attempts, settings.retry_base_s, settings.retry_cap_s)
+            # The retry is durable state ("QUEUED, due at retry_at"), not a delayed broker message.
+            # The reconciler publishes it when it is due.
+            transition(
+                db,
+                job.tenant_id,
+                job.file_id,
+                Status.PROCESSING,
+                Status.QUEUED,
+                retry_at=utcnow() + timedelta(seconds=delay),
+                error_code=code,
+                error_message=message[:500],
+            )
+            logger.warning(
+                "retry scheduled",
+                extra={"fields": {"error_code": code, "attempt": attempts, "delay_s": round(delay, 1)}},
+            )
+            return
+        if not permanent:
+            message = f"gave up after {attempts} attempts: {message}"
+        transition(
+            db,
+            job.tenant_id,
+            job.file_id,
+            Status.PROCESSING,
+            Status.FAILED,
+            error_code=code,
+            error_message=message[:500],
+            finished_at=utcnow(),
+            retry_at=None,
+        )
+    if permanent:
+        logger.warning("file failed", extra={"fields": {"error_code": code}})
+    else:
+        logger.error("file failed", exc_info=exc, extra={"fields": {"error_code": code}})
 
 
 def _finish(job: JobMessage, sha256: str, chunk_count: int) -> None:
@@ -119,28 +173,6 @@ def _finish(job: JobMessage, sha256: str, chunk_count: int) -> None:
         )
         if not done:
             logger.warning("could not mark READY: state changed underneath us")
-
-
-def _fail(job: JobMessage, exc: Exception) -> None:
-    if isinstance(exc, (PermanentError, TransientError)):
-        code, message = exc.code, str(exc)
-    else:
-        code, message = "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}"
-    if isinstance(exc, PermanentError):
-        logger.warning("file failed", extra={"fields": {"error_code": code}})
-    else:
-        logger.error("file failed", exc_info=exc, extra={"fields": {"error_code": code}})
-    with session_scope() as db:
-        transition(
-            db,
-            job.tenant_id,
-            job.file_id,
-            Status.PROCESSING,
-            Status.FAILED,
-            error_code=code,
-            error_message=message[:500],
-            finished_at=utcnow(),
-        )
 
 
 def stage_parse(deps: Deps, info: FileInfo, work: Path) -> str:

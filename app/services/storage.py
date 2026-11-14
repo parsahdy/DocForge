@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from collections.abc import Iterator
 
 import boto3
 from botocore.config import Config
@@ -63,6 +64,9 @@ class Storage:
         extra = {"Metadata": metadata} if metadata else None
         self._internal.upload_file(str(src), self.bucket, key, ExtraArgs=extra)
 
+    def delete(self, key: str) -> None:
+        self._internal.delete_object(Bucket=self.bucket, Key=key)  # idempotent: no error if it is already gone
+
     def ensure_bucket(self) -> None:
         try:
             self._internal.head_bucket(Bucket=self.bucket)
@@ -70,3 +74,8 @@ class Storage:
             if str(exc.response.get("Error", {}).get("Code")) not in _NOT_FOUND:
                 raise
             self._internal.create_bucket(Bucket=self.bucket)
+
+    def iter_objects(self, prefix: str = "") -> Iterator[dict[str, Any]]:
+        paginator = self._internal.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            yield from page.get("Contents", [])

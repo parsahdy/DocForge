@@ -13,6 +13,9 @@ QUEUE_SMALL = "small"
 QUEUE_LARGE = "large"
 QUEUES = (QUEUE_SMALL, QUEUE_LARGE)
 
+DLX_EXCHANGE = "dlx"  # dead letter exchange
+DEAD_QUEUE = "dead"  # where undeliverable messages end up, for a human to inspect
+
 
 def route_queue(size_bytes: int, small_max_mb: int) -> str:
     return QUEUE_SMALL if size_bytes < small_max_mb * MB else QUEUE_LARGE

@@ -41,4 +41,11 @@ class File(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    __table_args__ = (Index("ix_files_tenant_status", "tenant_id", "status"),)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    original_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_files_tenant_status", "tenant_id", "status"),
+        # Deliberate exception to "tenant first" (W1): the reconciler scans ALL tenants by status and age.
+        Index("ix_files_status_updated", "status", "updated_at"),
+    )

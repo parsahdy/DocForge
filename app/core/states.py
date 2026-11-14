@@ -16,11 +16,11 @@ class Status(str, Enum):
 
 ALLOWED: dict[Status, frozenset[Status]] = {
     Status.PENDING_UPLOAD: frozenset({Status.UPLOADED}),
-    Status.UPLOADED: frozenset({Status.QUEUED}),
-    Status.QUEUED: frozenset({Status.PROCESSING}),
-    Status.PROCESSING: frozenset({Status.READY, Status.FAILED, Status.QUEUED}),
+    Status.UPLOADED: frozenset({Status.QUEUED, Status.FAILED}),
+    Status.QUEUED: frozenset({Status.PROCESSING, Status.FAILED}),
+    Status.PROCESSING: frozenset({Status.READY, Status.FAILED, Status.QUEUED}),  # QUEUED = retry or reaper
     Status.READY: frozenset(),
-    Status.FAILED: frozenset({Status.QUEUED}),
+    Status.FAILED: frozenset({Status.QUEUED}),  # manual retry (FR4)
 }
 
 class IllegalTransition(Exception):

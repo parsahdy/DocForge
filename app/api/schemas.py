@@ -43,3 +43,4 @@ class FileOut(BaseModel):
 class FileListOut(BaseModel):
     items: list[FileOut]
     next_after: uuid.UUID | None
+    retry_at: datetime | None

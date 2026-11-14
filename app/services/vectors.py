@@ -57,12 +57,26 @@ class VectorStore:
     def upsert(self, points: list[models.PointStruct]) -> None:
         self._client.upsert(collection_name=self.alias, points=points, wait=True)
 
+    @staticmethod
+    def _file_conditions(tenant_id: str, file_id: uuid.UUID) -> list[models.FieldCondition]:
+        """The tenant condition is mandatory in the signature: no query without a tenant."""
+        return [
+            models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
+            models.FieldCondition(key="file_id", match=models.MatchValue(value=str(file_id))),
+        ]
+
     def count_for_file(self, tenant_id: str, file_id: uuid.UUID) -> int:
-        """The tenant filter is mandatory in the signature: no query without a tenant."""
-        flt = models.Filter(
-            must=[
-                models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
-                models.FieldCondition(key="file_id", match=models.MatchValue(value=str(file_id))),
-            ]
-        )
+        flt = models.Filter(must=self._file_conditions(tenant_id, file_id))
         return self._client.count(collection_name=self.alias, count_filter=flt, exact=True).count
+
+    def delete_other_versions(self, tenant_id: str, file_id: uuid.UUID, keep_version: str) -> None:
+        """Remove points written by another chunker version: orphans left behind by a re-chunk."""
+        flt = models.Filter(
+            must=self._file_conditions(tenant_id, file_id),
+            must_not=[models.FieldCondition(key="chunker_version", match=models.MatchValue(value=keep_version))],
+        )
+        self._client.delete(
+            collection_name=self.alias,
+            points_selector=models.FilterSelector(filter=flt),
+            wait=True,
+        )

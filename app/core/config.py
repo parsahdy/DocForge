@@ -60,6 +60,25 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 5
 
+    # --- reliability (Stage 2) -----------------------------------------------
+    max_attempts: int = 5  # total attempts per file, the first one included
+    retry_base_s: int = 10  # the backoff ceiling doubles from this value...
+    retry_cap_s: int = 300  # ...up to this value
+    task_soft_time_limit_s: int = 600
+    task_hard_time_limit_s: int = 900
+    queue_delivery_limit: int = 5  # quorum queues: redeliveries before a message is dead-lettered
+
+    # --- maintenance: reconciler, janitor, retention (D5) ----------------------
+    reconcile_interval_s: int = 30
+    maintenance_batch: int = 200  # files per rule per cycle: bounds the burst we create ourselves
+    stuck_uploaded_s: int = 120
+    stuck_queued_s: int = 900
+    stuck_processing_s: int = 1200  # must exceed the hard time limit
+    pending_upload_ttl_s: int = 86400
+    orphan_grace_s: int = 3600
+    retention_originals_days: int = 7
+    retention_failed_days: int = 30
+
     @model_validator(mode="after")
     def _check_consistency(self) -> "Settings":
         if self.chunk_overlap_chars * 2 >= self.chunk_chars:
@@ -68,6 +87,10 @@ class Settings(BaseSettings):
             raise ValueError("SIZE_CLASS_SMALL_MAX_MB cannot exceed MAX_FILE_MB")
         if not 0.0 <= self.embed_error_rate <= 1.0:
             raise ValueError("EMBED_ERROR_RATE must be between 0 and 1")
+        if self.task_soft_time_limit_s >= self.task_hard_time_limit_s:
+            raise ValueError("TASK_SOFT_TIME_LIMIT_S must be smaller than TASK_HARD_TIME_LIMIT_S")
+        if self.stuck_processing_s <= self.task_hard_time_limit_s:
+            raise ValueError("STUCK_PROCESSING_S must exceed TASK_HARD_TIME_LIMIT_S, or healthy tasks get reaped")
         return self
 
 
