@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     retention_originals_days: int = 7
     retention_failed_days: int = 30
 
+    # --- tenant fairness (Stage 3) -------------------------------------------
+    redis_state_url: str = "redis://localhost:6379/0"
+    tenant_rate_per_s: int = 5  # new uploads per second per tenant
+    tenant_max_backlog: int = 500  # UPLOADED + QUEUED + PROCESSING files per tenant
+    tenant_max_concurrent: int = 4  # files of one tenant processed at the same time
+    tenant_defer_s: int = 15  # base wait when a tenant is at its concurrency cap
+    tenant_retry_after_s: int = 30  # Retry-After for a full backlog
+    reconcile_per_tenant_batch: int = 20  # files per tenant per reconcile cycle
+
     @model_validator(mode="after")
     def _check_consistency(self) -> "Settings":
         if self.chunk_overlap_chars * 2 >= self.chunk_chars:

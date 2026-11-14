@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, or_, select, update, func
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -100,11 +100,19 @@ def _publish_due(settings: Settings, storage: Storage, publish: Publisher) -> tu
         File.retry_at <= now,  # a scheduled retry whose time has come
         and_(File.retry_at.is_(None), File.updated_at <= lost_cutoff),  # queued for too long: the message may be lost
     )
+    # Fairness: take at most N files per tenant, interleaved. Without this, one tenant with
+    # thousands of due files would fill the whole batch and starve everybody else.
+    position = func.row_number().over(partition_by=File.tenant_id, order_by=File.updated_at).label("position")
+    candidates = (
+        select(File.tenant_id, File.file_id, File.queue, File.size_bytes, File.s3_key, File.updated_at, position)
+        .where(File.status == Status.QUEUED.value, due)
+        .subquery()
+    )
     with session_scope() as db:
         rows = db.execute(
-            select(File.tenant_id, File.file_id, File.queue, File.size_bytes, File.s3_key)
-            .where(File.status == Status.QUEUED.value, due)
-            .order_by(File.updated_at)
+            select(candidates.c.tenant_id, candidates.c.file_id, candidates.c.queue, candidates.c.size_bytes, candidates.c.s3_key)
+            .where(candidates.c.position <= settings.reconcile_per_tenant_batch)
+            .order_by(candidates.c.position, candidates.c.updated_at)  # first of every tenant, then second of every tenant...
             .limit(settings.maintenance_batch)
         ).all()
 

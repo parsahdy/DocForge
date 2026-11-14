@@ -18,6 +18,7 @@ import logging
 import tempfile
 import time
 import uuid
+import random
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ from app.pipeline.embed import Embedder
 from app.pipeline.parse import parse_file
 from app.services.storage import Storage
 from app.services.vectors import VectorStore
+from app.services.tenant_limits import get_limiter
 
 logger = logging.getLogger("docforge.pipeline")
 
@@ -67,22 +69,55 @@ def run_job(job: JobMessage, deps: Deps) -> None:
         info = _claim(job)
         if info is None:
             return  # duplicate or stale message: someone else owns this file, nothing to do
-        started = time.perf_counter()
+        limiter = get_limiter()
+        # Fairness: the slot is requested AFTER the claim, so only the unique winner of a file
+        # ever touches the slot (a duplicate message cannot release somebody else's slot).
+        if not limiter.acquire_slot(info.tenant_id, info.file_id):
+            _defer(job, deps.settings)
+            return
         try:
-            with tempfile.TemporaryDirectory(prefix="docforge-") as tmp:  # no state survives the task (W9)
-                work = Path(tmp)
-                sha256 = stage_parse(deps, info, work)
-                stage_chunk(deps, info, work)
-                chunk_count = stage_embed(deps, info, work)
-            # Idempotency, part 2: remove points a previous chunker version left behind.
-            deps.vectors.delete_other_versions(info.tenant_id, info.file_id, deps.settings.chunker_version)
-            _finish(job, sha256, chunk_count)
-            logger.info(
-                "file ready",
-                extra={"fields": {"chunks": chunk_count, "duration_s": round(time.perf_counter() - started, 2)}},
-            )
-        except Exception as exc:  # noqa: BLE001 - every failure must end in a recorded state
-            _handle_failure(job, exc, deps.settings)
+            _process(job, info, deps)
+        finally:
+            limiter.release_slot(info.tenant_id, info.file_id)
+
+
+def _process(job: JobMessage, info: FileInfo, deps: Deps) -> None:
+    started = time.perf_counter()
+    try:
+        with tempfile.TemporaryDirectory(prefix="docforge-") as tmp:  # no state survives the task (W9)
+            work = Path(tmp)
+            sha256 = stage_parse(deps, info, work)
+            stage_chunk(deps, info, work)
+            chunk_count = stage_embed(deps, info, work)
+        # Idempotency, part 2: remove points a previous chunker version left behind.
+        deps.vectors.delete_other_versions(info.tenant_id, info.file_id, deps.settings.chunker_version)
+        _finish(job, sha256, chunk_count)
+        logger.info(
+            "file ready",
+            extra={"fields": {"chunks": chunk_count, "duration_s": round(time.perf_counter() - started, 2)}},
+        )
+    except Exception as exc:  # noqa: BLE001 - every failure must end in a recorded state
+        _handle_failure(job, exc, deps.settings)
+
+
+def _defer(job: JobMessage, settings: Settings) -> None:
+    """The tenant is at its concurrency cap: give the file back, to be published again later.
+
+    This is not a failure, so the attempt that _claim counted is given back. The wait is durable
+    state (retry_at), exactly like a retry, and a random factor spreads the deferred files.
+    """
+    delay = settings.tenant_defer_s * (1 + random.random())
+    with session_scope() as db:
+        transition(
+            db,
+            job.tenant_id,
+            job.file_id,
+            Status.PROCESSING,
+            Status.QUEUED,
+            attempts=File.attempts - 1,
+            retry_at=utcnow() + timedelta(seconds=delay),
+        )
+    logger.info("deferred: tenant at concurrency limit", extra={"fields": {"delay_s": round(delay, 1)}})
 
 
 def _claim(job: JobMessage) -> FileInfo | None:

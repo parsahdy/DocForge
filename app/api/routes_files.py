@@ -4,7 +4,7 @@ from pathlib import PurePosixPath
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_publisher, get_storage, require_tenant
@@ -21,6 +21,7 @@ from app.db.transitions import transition
 from app.pipeline.parse import SUPPORTED_EXTENSIONS
 from app.services.queue import Publisher
 from app.services.storage import Storage
+from app.services.tenant_limits import get_limiter
 
 logger = logging.getLogger("docforge.api")
 router = APIRouter(prefix="/files", tags=["files"])
@@ -30,6 +31,8 @@ Db = Annotated[Session, Depends(get_db)]
 StorageDep = Annotated[Storage, Depends(get_storage)]
 PublisherDep = Annotated[Publisher, Depends(get_publisher)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+_ACTIVE = (Status.UPLOADED.value, Status.QUEUED.value, Status.PROCESSING.value)
 
 
 def _get_or_404(db: Session, tenant_id: str, file_id: uuid.UUID) -> File:
@@ -51,7 +54,27 @@ def _publish_or_503(publish: Publisher, row: File, tenant_id: str, file_id: uuid
             detail="queue unavailable, retry", headers={"Retry-After": "5"}) from exc
 
 
-@router.post("", status_code=201, response_model=CreateFileResponse)
+def admission_guard(tenant_id: TenantId, db: Db) -> None:
+    """Backpressure at the door: refuse early and cheaply, with a clear "try again later" (429)."""
+    settings = get_settings()
+    if not get_limiter().allow_request(tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+            detail="too many uploads per second", 
+            headers={"Retry-After": "1"}
+        )
+    backlog = db.scalar(
+        select(func.count()).select_from(File).where(File.tenant_id == tenant_id, File.status.in_(_ACTIVE))
+    )
+    if backlog >= settings.tenant_max_backlog:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="too many files waiting; wait for some to finish",
+            headers={"Retry-After": str(settings.tenant_retry_after_s)},
+        )
+
+
+@router.post("", status_code=201, response_model=CreateFileResponse, dependencies=[Depends(admission_guard)])
 def create_file(
     body: CreateFileRequest,
     tenant_id: TenantId,
