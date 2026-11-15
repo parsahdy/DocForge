@@ -18,4 +18,4 @@ DEAD_QUEUE = "dead"  # where undeliverable messages end up, for a human to inspe
 
 
 def route_queue(size_bytes: int, small_max_mb: int) -> str:
-    return QUEUE_SMALL if size_bytes < small_max_mb * MB else QUEUE_LARGE
+    return QUEUE_SMALL if size_bytes <= small_max_mb * MB else QUEUE_LARGE
